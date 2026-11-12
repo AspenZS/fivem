@@ -1,0 +1,117 @@
+name: build-linux-client-current
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build current FiveM client with Wine support
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      PROGRAM: five
+      GYP_MSVS_VERSION: '2022'
+      npm_config_msvs_version: '2022'
+
+    steps:
+      - name: Checkout this exact patched revision
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Generate and build five release
+        shell: bash
+        run: |
+          python -m pip install setuptools || py -m pip install setuptools || true
+          pwsh ./fxd.ps1 get-chrome
+          ./prebuild.cmd
+          pwsh ./fxd.ps1 gen -game five
+          cd code/build/five
+          MSBuild.exe CitizenMP.sln -t:build -restore -p:RestorePackagesConfig=true -p:preferredtoolarchitecture=x64 -p:configuration=release -p:WindowsTargetPlatformVersion=10.0.22621.0 -maxcpucount:4 -v:m -fl1 "-flp1:logfile=errors.log;errorsonly" || { echo '=== errors.log ==='; tail -120 errors.log 2>/dev/null; exit 1; }
+
+      - name: Assemble and validate runnable client layout
+        shell: pwsh
+        env:
+          CI: ''
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          $L = Join-Path $env:GITHUB_WORKSPACE 'code\bin\five\release'
+          $ErrorActionPreference = 'Continue'
+
+          try {
+            & .\code\tools\build\run_postbuild.ps1 -LayoutDir $L -Game five -Configuration release
+          } catch {
+            Write-Host "postbuild threw; applying verified fallback layout: $_"
+          }
+
+          New-Item -ItemType Directory -Force "$L\bin" | Out-Null
+          New-Item -ItemType Directory -Force "$L\bin\cef" | Out-Null
+          New-Item -ItemType Directory -Force "$L\citizen" | Out-Null
+
+          # The launcher manifest is intentionally minimal. Copy it before the
+          # full client manifest so it can never overwrite net:base/net/game.
+          Copy-Item -Force -Recurse data\shared\* "$L\" -ErrorAction SilentlyContinue
+          Copy-Item -Force -Recurse data\launcher\* "$L\" -ErrorAction SilentlyContinue
+          Copy-Item -Force -Recurse data\client\* "$L\" -ErrorAction SilentlyContinue
+
+          $cef = Get-ChildItem vendor -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'cef*' } |
+            Select-Object -First 1
+          if ($cef) {
+            Copy-Item -Force "$($cef.FullName)\Release\*.dll" "$L\bin\" -ErrorAction SilentlyContinue
+            Copy-Item -Force "$($cef.FullName)\Release\*.bin" "$L\bin\" -ErrorAction SilentlyContinue
+            Copy-Item -Force "$($cef.FullName)\Resources\icudtl.dat" "$L\bin\" -ErrorAction SilentlyContinue
+            Copy-Item -Force "$($cef.FullName)\Resources\*.pak" "$L\bin\cef\" -ErrorAction SilentlyContinue
+            Copy-Item -Force "$($cef.FullName)\Resources\locales\en-US.pak" "$L\bin\cef\" -ErrorAction SilentlyContinue
+          }
+
+          $components = Get-Content "$L\components.json" -Raw | ConvertFrom-Json
+          $required = @('net:base', 'net', 'gta:game:five', 'adhesive')
+          $missing = @($required | Where-Object { $_ -notin $components })
+          if ($components.Count -lt 60 -or $missing.Count -gt 0) {
+            throw "Invalid client manifest: count=$($components.Count), missing=$($missing -join ',')"
+          }
+
+          foreach ($requiredFile in @('FiveM.exe', 'legitimacy.dll', 'net.dll', 'glue.dll', 'citizen\ui.zip', 'bin\libcef.dll')) {
+            if (-not (Test-Path "$L\$requiredFile")) {
+              throw "Missing required artifact file: $requiredFile"
+            }
+          }
+
+          $legitimacyExports = (& dumpbin.exe /exports "$L\legitimacy.dll" | Out-String)
+          $netImports = (& dumpbin.exe /imports "$L\net.dll" | Out-String)
+          if ($legitimacyExports -notmatch 'AttemptSteamAuth') {
+            throw 'Current legitimacy.dll does not export AttemptSteamAuth'
+          }
+          if ($netImports -notmatch 'AttemptSteamAuth' -or $netImports -match 'InitSteamSDKConnection') {
+            throw 'net.dll and legitimacy.dll use different Steam API generations'
+          }
+
+          Write-Host "Validated $($components.Count) components and matching current auth ABI."
+
+      - name: Upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivem-five-current-wine
+          path: code/bin/five/release
+          if-no-files-found: error
+          retention-days: 7
